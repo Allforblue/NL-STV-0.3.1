@@ -1,3 +1,5 @@
+# backend/core/execution/executor.py
+
 import pandas as pd
 import geopandas as gpd
 import plotly.express as px
@@ -12,7 +14,15 @@ import io
 import textwrap
 from typing import Dict, Any, List, Optional
 import logging
+
 from pydantic import BaseModel
+
+# 引入 SDK
+from core.sdk.visualizer import STVisualizer
+from core.sdk import operators as ops
+
+# 执行结果摘要器
+from core.execution.result_summarizer import ResultSummarizer
 
 logger = logging.getLogger(__name__)
 
@@ -34,8 +44,20 @@ class DashboardExecutionResult(BaseModel):
 
 
 class CodeExecutor:
+    """
+    代码执行器（Metadata-Aware 版）
+
+    当前职责：
+    1. 在安全上下文中执行 LLM 生成代码
+    2. 构建全局 ID 语义字典
+    3. 接收完整 component metadata，并传给 ResultSummarizer
+    4. 返回结构化执行结果
+
+    不再承担：
+    - 图表/地图的手工摘要逻辑
+    """
+
     def __init__(self):
-        # 预加载常用库，增加时空计算核心库，防止 LLM 忘记 import
         self.global_context = {
             "pd": pd,
             "gpd": gpd,
@@ -47,66 +69,185 @@ class CodeExecutor:
             "Point": Point,
             "Polygon": Polygon,
             "LineString": LineString,
-            "print": print
+            "print": print,
+            "stv": STVisualizer(),
+            "ops": ops
         }
+        self.summarizer = ResultSummarizer()
 
     def _dedent_code(self, code: str) -> str:
-        """精准去除多余缩进"""
         return textwrap.dedent(code).strip()
 
     def _make_serializable(self, obj: Any) -> Any:
         """
-        [增强] 递归将 Numpy/Pandas 类型转换为 Python 原生类型。
-        [修复] 增加了对复杂对象（如 Plotly Figure）的拦截，防止深度递归破坏动画帧或引发卡顿。
+        递归序列化执行结果，兼容：
+        - Plotly Figure
+        - numpy 标量
+        - pandas 时间对象
+        - ndarray
+        - dict/list
         """
-        # 0. [核心修复] 拦截 Plotly 对象，使用官方序列化方法，防止内部的 frames 数组在下方递归中丢失
-        # if hasattr(obj, "to_plotly_json"):
-        #     return obj.to_plotly_json()
-
-        # [核心修复] 使用 to_dict() 替代 to_plotly_json()
-        # to_dict() 是 Plotly 最全的序列化方法，能确保 frames 不丢失
         if hasattr(obj, "to_dict") and hasattr(obj, "layout") and hasattr(obj, "data"):
             return obj.to_dict()
 
-        # 1. 处理 Numpy 基础类型
         if isinstance(obj, (np.integer, np.int64, np.int32, np.int16, np.int8)):
             return int(obj)
+
         elif isinstance(obj, (np.floating, np.float64, np.float32, np.float16)):
-            if np.isnan(obj) or np.isinf(obj): return None
+            if np.isnan(obj) or np.isinf(obj):
+                return None
             return float(obj)
+
         elif isinstance(obj, (np.bool_, bool)):
             return bool(obj)
 
-        # 2. 处理 Pandas 时间戳与时间差
         elif isinstance(obj, (pd.Timestamp, pd.Timedelta)):
             return str(obj)
 
-        # 3. 处理地理几何对象接口 (为 InsightExtractor 提供描述)
+        elif isinstance(obj, np.datetime64):
+            return str(pd.to_datetime(obj))
+
         elif hasattr(obj, "__geo_interface__"):
             return "GEOMETRY_OBJECT"
 
-        # 4. 递归处理集合/数组
         elif isinstance(obj, np.ndarray):
             return self._make_serializable(obj.tolist())
+
         elif isinstance(obj, dict):
-            # 只有纯字典才深度清洗
             return {str(k): self._make_serializable(v) for k, v in obj.items()}
+
         elif isinstance(obj, (list, tuple, set)):
             return [self._make_serializable(v) for v in obj]
+
         else:
             return obj
 
+    def _build_global_id_map(self, safe_data_context: Dict[str, Any]) -> Dict[str, str]:
+        """
+        从数据上下文中自动嗅探字典表，构建全局 ID -> Name 映射。
+        用于摘要解释层和洞察层的可读性增强。
+        """
+        global_id_map = {}
+
+        for k, df in safe_data_context.items():
+            if isinstance(df, pd.DataFrame) and not df.empty:
+                cols = [str(c).lower() for c in df.columns]
+                id_col_idx = next((i for i, c in enumerate(cols) if 'id' in c), None)
+                name_col_idx = next(
+                    (i for i, c in enumerate(cols) if any(kw in c for kw in ['zone', 'name', 'borough', 'city'])),
+                    None
+                )
+
+                if id_col_idx is not None and name_col_idx is not None and len(df.columns) <= 6:
+                    id_col = df.columns[id_col_idx]
+                    name_col = df.columns[name_col_idx]
+                    try:
+                        temp_dict = dict(zip(
+                            df[id_col].astype(str).str.replace(r'\.0$', '', regex=True),
+                            df[name_col].astype(str)
+                        ))
+                        global_id_map.update(temp_dict)
+                        logger.info(f">>> [Executor] 成功构建全局语义字典，共提取 {len(temp_dict)} 个映射词条。")
+                    except Exception:
+                        pass
+
+        return global_id_map
+
+    def _extract_component_meta(self, comp: Any) -> Dict[str, Any]:
+        """
+        从 component definition（dict 或 Pydantic 对象）中提取摘要器所需的 metadata。
+        """
+        is_dict = isinstance(comp, dict)
+
+        component_id = comp.get('id') if is_dict else getattr(comp, 'id', 'unknown')
+        component_type = comp.get('type') if is_dict else getattr(comp, 'type', 'unknown')
+        title = comp.get('title') if is_dict else getattr(comp, 'title', component_id)
+
+        chart_config = comp.get('chart_config', {}) if is_dict else getattr(comp, 'chart_config', {})
+        map_config = comp.get('map_config', []) if is_dict else getattr(comp, 'map_config', [])
+        layout = comp.get('layout', {}) if is_dict else getattr(comp, 'layout', {})
+
+        # 兼容 Enum / Pydantic / 普通对象
+        component_type_str = str(component_type).split('.')[-1].lower()
+
+        # 若 config 是 Pydantic 对象，尽量转 dict
+        if hasattr(chart_config, "model_dump"):
+            chart_config = chart_config.model_dump()
+        elif chart_config is None:
+            chart_config = {}
+
+        if hasattr(layout, "model_dump"):
+            layout = layout.model_dump()
+
+        # map_config 可能是对象列表
+        if isinstance(map_config, list):
+            normalized_map_config = []
+            for item in map_config:
+                if hasattr(item, "model_dump"):
+                    normalized_map_config.append(item.model_dump())
+                else:
+                    normalized_map_config.append(item)
+            map_config = normalized_map_config
+        elif hasattr(map_config, "model_dump"):
+            map_config = map_config.model_dump()
+
+        return {
+            "component_id": component_id,
+            "component_type": component_type_str,
+            "title": title,
+            "chart_config": chart_config or {},
+            "map_config": map_config or [],
+            "layout": layout or {}
+        }
+
+    def _build_component_meta_map(
+        self,
+        component_ids: List[str],
+        component_defs: Optional[List[Any]] = None
+    ) -> Dict[str, Dict[str, Any]]:
+        """
+        优先使用 workflow 传入的完整 component definitions 构建 metadata map。
+        如果缺失，则回退到基于 component_id 的弱推断。
+        """
+        meta_map: Dict[str, Dict[str, Any]] = {}
+
+        if component_defs:
+            for comp in component_defs:
+                try:
+                    meta = self._extract_component_meta(comp)
+                    cid = meta["component_id"]
+                    meta_map[cid] = meta
+                except Exception as e:
+                    logger.warning(f"[Executor] Failed to parse component meta: {e}")
+
+        # 回退补齐：防止某些 component_ids 没在 component_defs 里
+        for cid in component_ids:
+            if cid not in meta_map:
+                inferred_type = "map" if "map" in cid else ("insight" if "insight" in cid else "chart")
+                meta_map[cid] = {
+                    "component_id": cid,
+                    "component_type": inferred_type,
+                    "title": cid,
+                    "chart_config": {},
+                    "map_config": [],
+                    "layout": {}
+                }
+
+        return meta_map
+
     def execute_dashboard_logic(
-            self,
-            code_str: str,
-            data_context: Dict[str, Any],
-            component_ids: List[str]
+        self,
+        code_str: str,
+        data_context: Dict[str, Any],
+        component_ids: List[str],
+        summaries: List[Dict[str, Any]] = None,
+        component_defs: Optional[List[Any]] = None
     ) -> DashboardExecutionResult:
-        """
-        执行看板逻辑并捕获多个组件结果，针对超大规模数据增强了统计稳定性。
-        """
+
         clean_code = self._dedent_code(code_str)
         local_scope = {}
+
+        print("运行的代码:\n", clean_code)
 
         old_stdout = sys.stdout
         redirected_output = io.StringIO()
@@ -115,8 +256,7 @@ class CodeExecutor:
         try:
             logger.info(">>> [Executor] 启动沙箱执行环境...")
 
-            # [关键] 深度隔离数据上下文
-            # 确保在多表 Join 或空间计算时，不会通过引用修改 Session 原始数据
+            # 1. 构建安全数据上下文
             safe_data_context = {}
             for k, v in data_context.items():
                 if hasattr(v, 'copy'):
@@ -124,92 +264,79 @@ class CodeExecutor:
                 else:
                     safe_data_context[k] = v
 
-            # 执行代码块
+            if summaries is not None:
+                safe_data_context['_metadata'] = summaries
+
+            # 2. 构建全局 ID 字典
+            global_id_map = self._build_global_id_map(safe_data_context)
+
+            # 3. 将全局 ID 字典注入 stv
+            try:
+                self.global_context["stv"]._global_id_map = global_id_map
+            except Exception:
+                pass
+
+            # 4. 执行生成代码
             exec(clean_code, self.global_context, local_scope)
 
             if "get_dashboard_data" not in local_scope:
                 raise ValueError("Generated code missing 'get_dashboard_data' function.")
 
-            # 调用生成函数
             all_results = local_scope["get_dashboard_data"](safe_data_context)
 
-            final_results = {}
-            insight_payload = {}
+            final_results: Dict[str, ComponentResult] = {}
+            insight_payload: Dict[str, Any] = {}
 
+            # 5. 使用完整 component metadata 构建 meta_map
+            component_meta_map = self._build_component_meta_map(
+                component_ids=component_ids,
+                component_defs=component_defs
+            )
+
+            # 6. 对每个组件结果做统一摘要
             for cid in component_ids:
-                if cid in all_results:
-                    res_obj = all_results[cid]
-                    summary = {}
+                if cid not in all_results:
+                    continue
 
-                    try:
-                        # 3.1 结构化数据特征提取 (DataFrame / GeoDataFrame)
-                        if isinstance(res_obj, (pd.DataFrame, pd.Series, gpd.GeoDataFrame)):
-                            row_count = len(res_obj)
-                            # 性能防护：对于超大规模数据，Insight 提取仅使用头部采样
-                            stats_df = res_obj if row_count < 100000 else res_obj.sample(100000)
+                res_obj = all_results[cid]
+                component_meta = component_meta_map.get(cid, {
+                    "component_id": cid,
+                    "component_type": "unknown",
+                    "title": cid,
+                    "chart_config": {},
+                    "map_config": [],
+                    "layout": {}
+                })
 
-                            if hasattr(res_obj, 'describe'):
-                                summary["basic_stats"] = self._make_serializable(
-                                    stats_df.describe(include='all').to_dict())
-
-                            summary["row_count"] = row_count
-
-                            # --- [新增] 地理空间指纹提取 ---
-                            if isinstance(res_obj, gpd.GeoDataFrame) and not res_obj.empty:
-                                summary["spatial_info"] = {
-                                    "crs": str(res_obj.crs),
-                                    "geom_type": str(res_obj.geom_type.mode()[0]) if not res_obj.empty else None,
-                                    "bounds": [float(x) for x in res_obj.total_bounds]  # [minx, miny, maxx, maxy]
-                                }
-
-                            # --- [核心] 时间序列特征提取 ---
-                            # 识别时间列或时间索引
-                            time_cols = [c for c in res_obj.columns if
-                                         pd.api.types.is_datetime64_any_dtype(res_obj[c])] if isinstance(res_obj,
-                                                                                                         pd.DataFrame) else []
-                            is_time_index = pd.api.types.is_datetime64_any_dtype(res_obj.index)
-
-                            if is_time_index or time_cols:
-                                num_cols = res_obj.select_dtypes(include=[np.number]).columns
-                                if not num_cols.empty:
-                                    col = num_cols[0]
-                                    series = res_obj[col]
-                                    summary["temporal_insights"] = {
-                                        "peak_value": float(series.max()),
-                                        "valley_value": float(series.min()),
-                                        "start_time": str(
-                                            res_obj.index[0] if is_time_index else res_obj[time_cols[0]].min()),
-                                        "end_time": str(
-                                            res_obj.index[-1] if is_time_index else res_obj[time_cols[0]].max())
-                                    }
-
-                        # 3.2 可视化对象特征提取
-                        elif hasattr(res_obj, 'data') and isinstance(res_obj.data, (list, tuple)):
-                            if len(res_obj.data) > 0:
-                                trace = res_obj.data[0]
-                                summary["viz_type"] = type(res_obj).__name__
-                                # 记录数据点大致规模，辅助洞察生成
-                                for attr in ['x', 'lat', 'values']:
-                                    if hasattr(trace, attr) and getattr(trace, attr) is not None:
-                                        summary["data_points"] = len(getattr(trace, attr))
-                                        break
-
-                    except Exception as e:
-                        logger.warning(f"Feature extraction failed for {cid}: {e}")
-
-                    if summary:
-                        insight_payload[cid] = summary
-
-                    # 这里的 res_obj 尚未执行 _make_serializable，保留了原始的 Figure 对象
-                    final_results[cid] = ComponentResult(
+                try:
+                    summary = self.summarizer.summarize_component(
                         component_id=cid,
-                        data=res_obj,
-                        summary_stats=summary
+                        result_obj=res_obj,
+                        component_meta=component_meta,
+                        global_id_map=global_id_map
                     )
+                except Exception as e:
+                    logger.warning(f"[Executor] Result summarization failed for {cid}: {e}")
+                    summary = {
+                        "component_id": cid,
+                        "component_type": component_meta.get("component_type", "unknown"),
+                        "title": component_meta.get("title", cid),
+                        "viz_type": "unknown",
+                        "semantic_role": "unknown",
+                        "narrative_hints": [f"摘要提取失败: {str(e)}"]
+                    }
+
+                if summary:
+                    insight_payload[cid] = summary
+
+                final_results[cid] = ComponentResult(
+                    component_id=cid,
+                    data=res_obj,
+                    summary_stats=summary
+                )
 
             sys.stdout = old_stdout
 
-            # [关键修复生效处] 这里的清洗现在不会破坏 Plotly 动画帧了
             clean_results = self._make_serializable(final_results)
             clean_insight = self._make_serializable(insight_payload)
 
@@ -220,15 +347,21 @@ class CodeExecutor:
                 code=clean_code
             )
 
-        except Exception:
+        except Exception as e:
             sys.stdout = old_stdout
             error_trace = traceback.format_exc()
-            logger.error(f"Sandbox Execution Failed:\n{error_trace}")
+
+            if "[SDK Error]" in str(e):
+                logger.warning(f"⚠️ [SDK AI Interaction Error]: {str(e)}")
+            else:
+                logger.error(f"Sandbox Execution Failed:\n{error_trace}")
+
             return DashboardExecutionResult(
                 success=False,
                 error=error_trace,
                 code=clean_code
             )
+
         finally:
             sys.stdout = old_stdout
             captured = redirected_output.getvalue()

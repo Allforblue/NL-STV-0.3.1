@@ -98,6 +98,11 @@ class MapLayerConfig(BaseModel):
 
 class ChartConfig(BaseModel):
     chart_type: ChartType
+
+    # [新增]: 接收 Planner 规划的图表映射维度，防止被静默丢弃
+    target_dimension: Optional[str] = Field("auto", description="X轴/目标分类维度")
+    target_metric: Optional[str] = Field("auto", description="Y轴/目标度量指标")
+
     x_axis: Optional[str] = None
     y_axis: Optional[List[str]] = None
     series_name: Optional[str] = None

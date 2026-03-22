@@ -10,14 +10,14 @@
 1. 支持返回绘制图表的理由，这个dashboard_planner里已经写了传给前端就行
 2. 时间部分还有点问题，聚合步长有点问题，在dashboard里决定1H 还是1D
 3. 重构scaffold.py，目前提示词已经严重膨胀，需要将常用代码（如风格配置）封装成SDK
-4. 处理scaffold硬编码问题，防止过拟合，更具有通用性 
+4. 处理scaffold硬编码问题，防止过拟合，更具有通用性 recipe优化
 5. 交互，地图上自主选择数据，这一步是核心挑战
 6. insight组件修复
 
 #### 项目组织架构
-暂未更新
+
 ```text
-NL-STV-V0.2.1
+NL-STV-V0.3.1
 ├── backend/
 │   ├── api/
 │   │   ├── __init__.py
@@ -55,14 +55,24 @@ NL-STV-V0.2.1
 │       │   ├── dashboard.py
 │       │   ├── interaction.py
 │       │   └── state.py
+│       ├── sdk/
+│       │   ├── __init__.py
+│       │   ├── constraints.py
+│       │   ├── data_utils.py
+│       │   ├── layers.py
+│       │   ├── operators.py
+│       │   └── visualizer.py
 │       ├── services/
 │       │   ├── __init__.py
 │       │   ├── session_service.py
 │       │   └── workflow.py
 │       └── __init__.py
-├── test/
 ├── __init__.py
-├── app.py
 ├── main.py
 └── pytest.ini
 ```
+
+### 下一步
+
+- 编辑模式这玩意还没正确接入
+- 框选功能还没实现，这个可以和editor一起弄，是同源的问题

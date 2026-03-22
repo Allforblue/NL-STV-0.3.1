@@ -12,6 +12,9 @@ from core.llm.AI_client import AIClient
 from core.services.workflow import AnalysisWorkflow
 from core.services.session_service import session_service
 
+from dotenv import load_dotenv
+load_dotenv()
+
 # --- 日志配置 ---
 logging.basicConfig(
     level=logging.INFO,

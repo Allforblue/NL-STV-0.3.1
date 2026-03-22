@@ -17,7 +17,7 @@ class AIClient:
     """
 
     def __init__(self,
-                 api_key="sk-60160407beb64fb989638a7e1aaadf12",  # os.getenv("DEEPSEEK_API_KEY"),  # 在这里输入KEY
+                 api_key="sk-5871f8d87ae6423ebfc34165a61aa1e9",  # os.getenv("DEEPSEEK_API_KEY"),  # 在这里输入KEY
                  model_name: str = "deepseek-chat",  # deepseek-chat (V3)
                  timeout: int = 120):
         """

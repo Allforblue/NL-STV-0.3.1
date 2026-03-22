@@ -25,7 +25,7 @@ def get_column_stats(df: pd.DataFrame) -> Dict[str, Any]:
 
         # 优化点 1：修改采样策略，均匀获取大约 10 个样本，更好地向大模型体现数据的真实跨度
         valid_series = series.dropna()
-        n_samples = 10
+        n_samples = 3
         if len(valid_series) > n_samples:
             # 使用 linspace 生成均匀分布的索引，确保覆盖首、中、尾数据
             indices = np.linspace(0, len(valid_series) - 1, num=n_samples, dtype=int)

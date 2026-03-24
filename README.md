@@ -29,7 +29,8 @@ NL-STV-V0.3.1
 │       ├── execution/
 │       │   ├── __init__.py
 │       │   ├── executor.py
-│       │   └── insight_extractor.py
+│       │   ├── insight_extractor.py
+│       │   └── result_summarizer.py
 │       ├── generation/
 │       │   ├── __init__.py
 │       │   ├── viz_generator.py

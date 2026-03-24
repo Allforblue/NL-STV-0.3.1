@@ -156,10 +156,22 @@ You MUST aggregate first using pandas or `ops.safe_resample()`.
 
 3. `stv.line(df, time_col=None, val_col=None) -> Figure`
 - Best used with resampled time series
+- Use this for continuous temporal trends:
+  - hourly trend
+  - daily trend
+  - weekly trend
+  - month-long day-by-day change
+- If the user asks for "变化趋势", "随时间变化", "每天变化", "每日趋势", prefer `stv.line(...)`
 
 4. `stv.periodic_bar(df, time_col=None, val_col=None, cycle='hour') -> Figure`
 - Periodic distribution chart
-- Can often use raw event-level data
+- Use this only for repeated periodic patterns:
+  - by hour of day
+  - by day of week
+- Supported cycle values are only:
+  - 'hour'
+  - 'dayofweek'
+- NEVER use `periodic_bar(cycle='day')` for continuous daily trend analysis across a month
 """
 
         # ==========================================
@@ -184,6 +196,16 @@ WRONG pattern:
 - `ops.safe_resample(..., val_col=None, agg_func='sum')`
 
 NEVER assume a `count` column will be auto-created.
+CONTINUOUS TIME TREND RULE:
+- If the user asks for day-by-day change across a month, use `stv.line(...)`
+- If the user asks for continuous daily trend, resample with `freq='1d'`
+- Do NOT use `stv.periodic_bar(..., cycle='day')` for this case
+
+PERIODIC PATTERN RULE:
+- Use `stv.periodic_bar(...)` only for repeating cycles such as:
+  - hour of day
+  - day of week
+- `periodic_bar` is NOT the correct chart for continuous calendar-day evolution
 """
 
         # ==========================================
@@ -245,24 +267,45 @@ def get_top_bar(data_context):
         # line numeric few-shot
         # ==========================================
         self.examples_chart_line_numeric = """
-=== NUMERIC LINE CHART EXAMPLE ===
+        === NUMERIC LINE CHART EXAMPLE ===
 
-[Example: Numeric time trend]
-def get_time_line(data_context):
-    df_orders = data_context.get('df_orders').copy()
-    df_daily = ops.safe_resample(
-        df=df_orders,
-        time_col='order_time',
-        val_col='amount',
-        freq='1d',
-        agg_func='sum'
-    )
-    return stv.line(
-        df=df_daily,
-        time_col='order_time',
-        val_col='amount'
-    )
-"""
+        [Example: Numeric time trend]
+        def get_time_line(data_context):
+            df_orders = data_context.get('df_orders').copy()
+            df_daily = ops.safe_resample(
+                df=df_orders,
+                time_col='order_time',
+                val_col='amount',
+                freq='1d',
+                agg_func='sum'
+            )
+            return stv.line(
+                df=df_daily,
+                time_col='order_time',
+                val_col='amount'
+            )
+
+        [Example: Daily trend across one month]
+        def get_daily_trip_trend(data_context):
+            df_trips = data_context.get('df_trips')[['pickup_time']].copy()
+            df_trips['trip_count'] = 1
+            df_daily = ops.safe_resample(
+                df=df_trips,
+                time_col='pickup_time',
+                val_col='trip_count',
+                freq='1d',
+                agg_func='sum'
+            )
+            return stv.line(
+                df=df_daily,
+                time_col='pickup_time',
+                val_col='trip_count'
+            )
+
+        [Wrong pattern]
+        Do NOT write:
+        stv.periodic_bar(df=df_trips, time_col='pickup_time', val_col='trip_count', cycle='day')
+        """
 
         # ==========================================
         # line count few-shot
@@ -320,6 +363,8 @@ ops.safe_resample(df, time_col='pickup_time', val_col=None, freq='1h', agg_func=
                 comp_hints += "Hint: prefer `ops.safe_resample(...)` before `stv.line(...)`.\n"
                 comp_hints += "Hint: if the metric is count-like, create a helper count column first.\n"
                 comp_hints += "Hint: NEVER use `safe_resample(..., val_col=None, agg_func='sum')` for count trends.\n"
+                comp_hints += "Hint: use `stv.line(...)` for continuous daily or hourly trends.\n"
+                comp_hints += "Hint: NEVER use `stv.periodic_bar(..., cycle='day')` for month-long day-by-day changes.\n"
             elif str(ctype).lower() == 'pie':
                 comp_hints += "Hint: aggregate by category first, then call `stv.pie(...)`.\n"
             elif str(ctype).lower() == 'periodic_bar':
@@ -465,6 +510,8 @@ Additional rules:
 - If the selected SDK method is a chart method, return the Figure directly.
 - For count-based line charts, ALWAYS create a helper count column first, then resample using that column.
 - NEVER use `safe_resample(..., val_col=None, agg_func='sum')`.
+- Use `stv.line(...)` for continuous day-by-day or hour-by-hour trend analysis.
+- NEVER use `stv.periodic_bar(..., cycle='day')` for continuous daily trend across a month.
 
 === FINAL OUTPUT FORMAT ===
 Return ONLY valid Python code block:

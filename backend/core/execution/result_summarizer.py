@@ -277,7 +277,7 @@ class ResultSummarizer:
                 "top_items_desc": ranked_desc[:5],
                 "bottom_items_asc": ranked_asc[:5],
                 "visible_order_note": (
-                    "该图为横向条形图，视觉上通常从上到下显示由小到大，顶部条目不一定是最大值。"
+                    "该图为横向条形图，视觉上通常从上到下显示由大到小，顶部条目是最大值。"
                     if orientation == 'h' else
                     "该图为纵向条形图，请以数值排序结果为准，而不是仅凭视觉位置判断。"
                 )

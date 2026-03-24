@@ -450,8 +450,10 @@ class STVisualizer:
         if len(df_plot) > top_n * 2 or df_plot[cat_col].duplicated().any():
             df_plot = df_plot.groupby(cat_col, as_index=False)[val_col].sum()
 
-        df_plot = df_plot.sort_values(val_col, ascending=True).tail(top_n)
+        # 改为按数值降序排列，并取前 top_n 个
+        df_plot = df_plot.sort_values(val_col, ascending=False).head(top_n)
 
+        # 图表类别的自动字典翻译
         df_plot[cat_col] = df_plot[cat_col].astype(str).str.replace(r'\.0$', '', regex=True)
         if self._global_id_map:
             df_plot[cat_col] = df_plot[cat_col].map(lambda x: self._global_id_map.get(str(x), x))
@@ -466,7 +468,19 @@ class STVisualizer:
         )
 
         self._apply_pro_layout(fig)
-        fig.update_layout(yaxis={'type': 'category'}, showlegend=False, margin=dict(l=150))
+
+        # 强制按当前 dataframe 顺序显示，确保最大值在最上面
+        fig.update_layout(
+            yaxis={
+                'type': 'category',
+                'categoryorder': 'array',
+                'categoryarray': df_plot[cat_col].tolist(),
+                'autorange': 'reversed'
+            },
+            showlegend=False,
+            margin=dict(l=150)
+        )
+
         return fig
 
     def pie(self, df: pd.DataFrame, names: str, values: str, top_n: int = 8):
@@ -507,6 +521,11 @@ class STVisualizer:
         return self._apply_pro_layout(fig)
 
     def periodic_bar(self, df: pd.DataFrame, time_col: str = None, val_col: str = None, cycle: str = 'hour'):
+        if cycle not in ['hour', 'dayofweek']:
+            raise ValueError(
+                f"[SDK Error] periodic_bar 仅支持 cycle='hour' 或 'dayofweek'，"
+                f"不支持 cycle='{cycle}'。如果你要看按天连续变化趋势，请使用 `ops.safe_resample(..., freq='1d') + stv.line(...)`。"
+            )
         time_col = infer_time_col(df, time_col)
         val_col = infer_numeric_col(df, val_col)
 

@@ -15,7 +15,7 @@ logger = logging.getLogger(__name__)
 
 class CodeGenerator:
     """
-    代码生成器 (V6.3 Planner-Locked Metric Edition)
+    代码生成器（长期 RenderMeta 兼容版）
 
     核心目标：
     1. 强化 LLM 对 stv / ops SDK 的遵循
@@ -23,12 +23,16 @@ class CodeGenerator:
     3. 在执行前用静态规则拦截明显违规代码
     4. 与“地图统一返回协议对象、图表返回 Figure”的 SDK 约定对齐
     5. 强制遵守 planner 锁定的 primary_metric / primary_dimension
+    6. 兼容输出 component_render_meta，为前端点击与 workflow 状态化提供稳定语义
     """
 
     def __init__(self, llm_client: AIClient):
         self.llm = llm_client
         self.scaffold = STChartScaffold()
 
+    # =========================================================
+    # 基础清洗 / 解析工具
+    # =========================================================
     def _clean_markdown(self, text: str) -> str:
         if not text:
             return ""
@@ -141,7 +145,7 @@ class CodeGenerator:
             return False, "[Validation] 缺少合法函数签名，必须为 def get_xxx(data_context):"
 
         if "stv." not in code:
-            return False, "[Validation] 未检测到 stv SDK 调用，必须使用 stv.xxx(...) 进行渲染。"
+            return False, "[Validation] 未检测到 stv SDK调用，必须使用 stv.xxx(...) 进行渲染。"
 
         if "stv.animated_map(" in code or "stv.animated_scatter(" in code:
             forbidden_time_patterns = [
@@ -157,10 +161,10 @@ class CodeGenerator:
 
         return True, ""
 
+    # =========================================================
+    # Planner 约束抽取
+    # =========================================================
     def _extract_component_constraints(self, comp: Any) -> Dict[str, Any]:
-        """
-        从 planner 生成的 component plan 中提取锁定约束。
-        """
         is_dict = isinstance(comp, dict)
 
         c_id = comp.get('id') if is_dict else getattr(comp, 'id', 'unknown')
@@ -201,9 +205,6 @@ class CodeGenerator:
         return constraints
 
     def _build_locked_constraints_text(self, constraints: Dict[str, Any]) -> str:
-        """
-        将 planner 锁定信息转成 prompt 文本。
-        """
         ctype = constraints.get("component_type", "unknown")
         locked_metric = constraints.get("locked_metric")
         locked_dimension = constraints.get("locked_dimension")
@@ -247,6 +248,131 @@ class CodeGenerator:
 
         return "\n".join(lines)
 
+    # =========================================================
+    # Render Meta 推断（保守版）
+    # =========================================================
+    def _infer_display_dimension_from_locked_dimension(self, locked_dimension: Optional[str]) -> Optional[str]:
+        if not locked_dimension:
+            return None
+
+        dim = str(locked_dimension).strip()
+        lower_dim = dim.lower()
+
+        # 这是保守推断，不是最终语义解析器
+        if lower_dim in ["pulocationid", "dolocationid", "locationid"]:
+            return "Zone"
+        return dim
+
+    def _infer_fact_link_field(self, locked_dimension: Optional[str], component_type: str) -> Optional[str]:
+        if not locked_dimension:
+            return None
+
+        dim = str(locked_dimension).strip()
+        lower_dim = dim.lower()
+
+        if component_type == "chart":
+            if lower_dim in ["pulocationid", "dolocationid", "locationid"]:
+                return dim
+            return dim
+
+        if component_type == "map":
+            if lower_dim in ["pulocationid", "dolocationid", "locationid"]:
+                return dim
+            return dim
+
+        return dim
+
+    def _infer_render_meta_from_component_plan(self, comp: Any) -> Dict[str, Any]:
+        """
+        基于 planner component plan 的保守推断。
+        当 LLM 暂时还没有返回 render_meta 时，至少保证组件配置不完全失真。
+        """
+        constraints = self._extract_component_constraints(comp)
+        ctype = constraints.get("component_type", "unknown")
+        locked_metric = constraints.get("locked_metric")
+        locked_dimension = constraints.get("locked_dimension")
+
+        display_dimension = self._infer_display_dimension_from_locked_dimension(locked_dimension)
+        fact_link_field = self._infer_fact_link_field(locked_dimension, ctype)
+
+        meta = {
+            "display_dimension": display_dimension,
+            "display_metric": locked_metric,
+            "interaction_field": display_dimension or locked_dimension,
+            "interaction_key_field": None,
+            "fact_link_field": fact_link_field
+        }
+
+        if ctype == "map":
+            meta["interaction_field"] = display_dimension or locked_dimension
+            meta["fact_link_field"] = fact_link_field
+
+        return meta
+
+    def _extract_render_meta_from_code(self, code: str, fallback_meta: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        轻量级静态提取器（保守增强版）：
+        尝试从代码中提取最终展示字段，提取失败时回退到 fallback_meta。
+        """
+        meta = dict(fallback_meta or {})
+
+        try:
+            # stv.bar(df=..., x_val='Zone', y_cat='trip_count')
+            bar_match = re.search(
+                r"stv\.bar\(\s*.*?x_val\s*=\s*['\"]([^'\"]+)['\"].*?y_cat\s*=\s*['\"]([^'\"]+)['\"]",
+                code,
+                flags=re.DOTALL
+            )
+            if bar_match:
+                meta["display_dimension"] = bar_match.group(1)
+                meta["display_metric"] = bar_match.group(2)
+                meta["interaction_field"] = bar_match.group(1)
+                return meta
+
+            # stv.pie(df=..., names='Borough', values='trip_count')
+            pie_match = re.search(
+                r"stv\.pie\(\s*.*?names\s*=\s*['\"]([^'\"]+)['\"].*?values\s*=\s*['\"]([^'\"]+)['\"]",
+                code,
+                flags=re.DOTALL
+            )
+            if pie_match:
+                meta["display_dimension"] = pie_match.group(1)
+                meta["display_metric"] = pie_match.group(2)
+                meta["interaction_field"] = pie_match.group(1)
+                return meta
+
+            # stv.line(df=..., time_col='pickup_time', val_col='trip_count')
+            line_match = re.search(
+                r"stv\.line\(\s*.*?time_col\s*=\s*['\"]([^'\"]+)['\"].*?val_col\s*=\s*['\"]([^'\"]+)['\"]",
+                code,
+                flags=re.DOTALL
+            )
+            if line_match:
+                meta["display_dimension"] = line_match.group(1)
+                meta["display_metric"] = line_match.group(2)
+                meta["interaction_field"] = line_match.group(1)
+                return meta
+
+            # stv.choropleth / animated_map
+            map_match = re.search(
+                r"stv\.(?:choropleth|animated_map)\(\s*.*?data_key\s*=\s*['\"]([^'\"]+)['\"].*?val_col\s*=\s*['\"]([^'\"]+)['\"]",
+                code,
+                flags=re.DOTALL
+            )
+            if map_match:
+                meta["interaction_field"] = map_match.group(1)
+                meta["fact_link_field"] = map_match.group(1)
+                meta["display_metric"] = map_match.group(2)
+                return meta
+
+        except Exception:
+            pass
+
+        return meta
+
+    # =========================================================
+    # 修复重试
+    # =========================================================
     async def _retry_on_validation_failure(
         self,
         system_prompt: str,
@@ -286,6 +412,9 @@ Return ONLY the fixed Python code block.
 
         return self._clean_markdown(raw_response)
 
+    # =========================================================
+    # 单组件生成
+    # =========================================================
     async def _generate_single_component(
         self,
         comp: Any,
@@ -295,7 +424,7 @@ Return ONLY the fixed Python code block.
         time_bounds_hint: str,
         frame_format_hint: str,
         interaction_hint: str
-    ) -> Dict[str, str]:
+    ) -> Dict[str, Any]:
         is_dict = isinstance(comp, dict)
         c_id = comp.get('id') if is_dict else getattr(comp, 'id', 'unknown')
         safe_func_name = f"get_{c_id.replace('-', '_')}"
@@ -367,19 +496,27 @@ Return ONLY Python code.
             if not is_valid_retry:
                 logger.warning(f"  -> Retry validation still failed for {c_id}: {validation_error_retry}")
 
+        # Render Meta：先从 component plan 保守推断，再尝试用代码静态增强
+        fallback_meta = self._infer_render_meta_from_component_plan(comp)
+        render_meta = self._extract_render_meta_from_code(code, fallback_meta)
+
         return {
             "id": c_id,
             "func_name": safe_func_name,
-            "code": code
+            "code": code,
+            "render_meta": render_meta
         }
 
+    # =========================================================
+    # Dashboard 代码生成
+    # =========================================================
     async def generate_dashboard_code(
         self,
         query: str,
         summaries: List[Dict[str, Any]],
         component_plans: List[Any],
         interaction_hint: str = ""
-    ) -> str:
+    ) -> Dict[str, Any]:
         context_str = self._build_context_str(summaries)
         available_vars = [s.get('variable_name') for s in summaries]
 
@@ -434,9 +571,13 @@ Return ONLY Python code.
         master_script += "def get_dashboard_data(data_context):\n"
         master_script += "    dashboard_results = {}\n\n"
 
+        component_render_meta: Dict[str, Any] = {}
+
         for res in generated_results:
             indented_code = textwrap.indent(res['code'], '    ')
             master_script += indented_code + "\n\n"
+
+            component_render_meta[res["id"]] = res.get("render_meta", {}) or {}
 
         for cid in insight_components:
             safe_name = f"get_{cid.replace('-', '_')}"
@@ -465,8 +606,15 @@ Return ONLY Python code.
         master_script += "    return dashboard_results\n"
 
         logger.info("Parallel assembly complete. Returning unified execution script with sandbox isolation.")
-        return master_script
 
+        return {
+            "code": master_script,
+            "component_render_meta": component_render_meta
+        }
+
+    # =========================================================
+    # 自愈修复
+    # =========================================================
     async def fix_code(
         self,
         original_code: str,
@@ -480,7 +628,6 @@ Return ONLY Python code.
         component_plans = component_plans or []
         base_prompt = self.scaffold.get_system_prompt(context_str, component_plans)
 
-        # 汇总 planner 锁定约束，给 fix 阶段继续施压
         constraint_blocks = []
         for comp in component_plans:
             try:

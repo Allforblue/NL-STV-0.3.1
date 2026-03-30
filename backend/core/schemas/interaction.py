@@ -39,7 +39,7 @@ class InteractionPayload(BaseModel):
         description="地图框选或当前视窗范围[min_lon, min_lat, max_lon, max_lat]"
     )
 
-    # [新增] 视图状态：保存当前的经纬度、缩放、仰角等，确保看板更新后视角不重置
+    # 视图状态：保存当前的经纬度、缩放、仰角等，确保看板更新后视角不重置
     view_state: Optional[Dict[str, Any]] = Field(
         None,
         description="当前的地图视图状态 (longitude, latitude, zoom, pitch, bearing)"
@@ -51,7 +51,7 @@ class InteractionPayload(BaseModel):
         description="地图上点击选中的特定实体 ID 列表"
     )
 
-    # [新增] 通用分类选择值：如点击柱状图选中的 'Taxi' 类别
+    # 通用分类选择值：如点击柱状图选中的 'Taxi' 类别
     selected_values: Optional[Dict[str, Any]] = Field(
         None,
         description="分类筛选值映射，如 {'vehicle_type': 'bus'}"
@@ -61,6 +61,16 @@ class InteractionPayload(BaseModel):
     time_range: Optional[List[str]] = Field(
         None,
         description="时间范围过滤 [开始时间, 结束时间]"
+    )
+
+    # [新增] selection 状态更新模式：
+    # - replace: 替换当前激活选区（默认，兼容旧行为）
+    # - append: 追加到当前激活选区集合
+    # - compare_left: 将本次选区写入对比左侧
+    # - compare_right: 将本次选区写入对比右侧
+    selection_mode: Literal["replace", "append", "compare_left", "compare_right"] = Field(
+        default="replace",
+        description="选区更新模式：replace / append / compare_left / compare_right"
     )
 
     # --- 模态 3: 历史回溯 (History/State Management) ---
@@ -75,13 +85,19 @@ class InteractionPayload(BaseModel):
         description="是否强制重新规划看板（即忽略现有布局，完全推翻重做）"
     )
 
-    #[新增] 人机协同的模式决策字段
+    # 人机协同的模式决策字段
     force_mode: Literal["auto", "edit", "generate"] = Field(
         default="auto",
         description="看板更新模式：'auto' 由 AI 判定，'edit' 强制修改现有代码，'generate' 强制从零生成。"
     )
 
-    current_dashboard_id: Optional[str] = Field(None, description="当前页面正在显示的看板ID")
+    current_dashboard_id: Optional[str] = Field(
+        None,
+        description="当前页面正在显示的看板ID"
+    )
 
-    # [新增] 扩展参数：用于存储特定组件的自定义交互参数
-    extra_params: Dict[str, Any] = Field(default_factory=dict)
+    # 扩展参数：用于存储特定组件的自定义交互参数
+    extra_params: Dict[str, Any] = Field(
+        default_factory=dict,
+        description="扩展参数容器，可承载 selection_context、组件自定义参数等"
+    )

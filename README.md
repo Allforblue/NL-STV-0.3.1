@@ -34,6 +34,7 @@ NL-STV-V0.3.1
 │       ├── generation/
 │       │   ├── __init__.py
 │       │   ├── viz_generator.py
+│       │   ├── dashboard_script_utils.py
 │       │   ├── dashboard_planner.py
 │       │   ├── scaffold.py
 │       │   ├── templates.py
@@ -42,6 +43,11 @@ NL-STV-V0.3.1
 │       │   ├── __init__.py
 │       │   ├── ingestion.py
 │       │   └── loader_factory.py
+│       ├── interaction_solver/
+│       │   ├── __init__.py
+│       │   ├── interaction_router.py
+│       │   ├── selection_applier.py
+│       │   └── selection_resolver.py
 │       ├── llm/
 │       │   ├── __init__.py
 │       │   └── AI_client.py
@@ -77,3 +83,8 @@ NL-STV-V0.3.1
 
 - 编辑模式这玩意还没正确接入
 - 框选功能还没实现，这个可以和editor一起弄，是同源的问题
+- period_bar还有点问题，包括正确识别需要绘制周期图已经正确的绘制出周期图
+- viz_editor小细节修一下，图表正确改过来了但是标题和解释没有改，标题可能涉及dashboard_planner，因为标题是在这个里边编写的，也就是说viz_editor暂时还只是支持图表内容修改，还不支持向上调整dashboard
+- 高亮暂不支持
+- 目前viz_editor只支持几个功能:修改图表类型，改时间颗粒度
+- 时间趋势图在viz-editor模式下仍然会出现时间轴不是日期的情况，进一步测试发现就是不支持按天聚合，可能不是editor的问题

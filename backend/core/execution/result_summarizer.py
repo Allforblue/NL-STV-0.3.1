@@ -18,6 +18,7 @@ class ResultSummarizer:
     1. 将执行产物（Plotly Figure / STV Map Protocol / DataFrame）转换为统一的语义摘要
     2. 为 InsightExtractor 提供稳定、低歧义的结构化上下文
     3. 避免直接依赖 trace 顺序 / 图表视觉排列来推断图意
+    4. 在不引入 compare 专项 schema 的前提下，提升摘要质量与可解释性
     """
 
     def __init__(self):
@@ -101,6 +102,50 @@ class ResultSummarizer:
             "min_category": min_category,
             "min_value": min_value
         })
+
+    def _pick_dimension_field(self, chart_config: Dict[str, Any]) -> Optional[str]:
+        if not isinstance(chart_config, dict):
+            return None
+
+        for key in ["display_dimension", "target_dimension", "primary_dimension", "x_axis", "series_name"]:
+            value = chart_config.get(key)
+            if value and str(value).lower() != "auto":
+                return value
+
+        return None
+
+    def _pick_metric_field(self, chart_config: Dict[str, Any]) -> Optional[str]:
+        if not isinstance(chart_config, dict):
+            return None
+
+        for key in ["display_metric", "target_metric", "primary_metric"]:
+            value = chart_config.get(key)
+            if value and str(value).lower() != "auto":
+                return value
+
+        y_axis = chart_config.get("y_axis")
+        if isinstance(y_axis, list) and y_axis:
+            first = y_axis[0]
+            if first and str(first).lower() != "auto":
+                return first
+
+        return None
+
+    def _safe_range(self, values: List[float]) -> Dict[str, Optional[float]]:
+        if not values:
+            return {"min": None, "max": None}
+        return {
+            "min": float(min(values)),
+            "max": float(max(values))
+        }
+
+    def _safe_mean(self, values: List[float]) -> Optional[float]:
+        if not values:
+            return None
+        try:
+            return float(np.mean(values))
+        except Exception:
+            return None
 
     # =========================================================
     # 对外统一入口
@@ -186,7 +231,6 @@ class ResultSummarizer:
         elif trace_type == 'pie':
             return self._summarize_pie_trace(component_id, trace, component_meta, global_id_map)
         elif trace_type in ['scatter', 'scattergl']:
-            # line chart 在 plotly express line 中通常也是 scatter + mode=lines
             mode = getattr(trace, 'mode', '')
             if mode and 'lines' in str(mode):
                 return self._summarize_line_trace(component_id, trace, component_meta)
@@ -195,9 +239,13 @@ class ResultSummarizer:
             return self._to_native({
                 "component_id": component_id,
                 "component_type": component_meta.get("component_type", "chart"),
+                "title": component_meta.get("title", ""),
                 "viz_type": trace_type,
                 "semantic_role": "generic_chart",
-                "narrative_hints": [f"未针对 trace_type={trace_type} 做专门摘要，使用通用摘要。"]
+                "narrative_hints": [
+                    f"未针对 trace_type={trace_type} 做专门摘要，使用通用摘要。",
+                    "建议优先结合 headline_facts 与图表标题理解该组件。"
+                ]
             })
 
     def _summarize_bar_trace(
@@ -212,18 +260,13 @@ class ResultSummarizer:
         x_arr = np.array(trace.x if trace.x is not None else [], dtype=object)
         y_arr = np.array(trace.y if trace.y is not None else [], dtype=object)
 
-        # bar 图专门处理 orientation，避免误读
         if orientation == 'h':
             categories = [self._safe_translate(v, global_id_map) for v in y_arr]
             values = self._safe_number_list(x_arr)
-            dimension_field = "y"
-            metric_field = "x"
             semantic_role = "ranking_chart"
         else:
             categories = [self._safe_translate(v, global_id_map) for v in x_arr]
             values = self._safe_number_list(y_arr)
-            dimension_field = "x"
-            metric_field = "y"
             semantic_role = "ranking_chart"
 
         pair_count = min(len(categories), len(values))
@@ -241,17 +284,28 @@ class ResultSummarizer:
                 "narrative_hints": ["柱状图没有可用数据。"]
             })
 
-        # 重新按数值排序，而不是依赖视觉顺序
         ranked_desc = sorted(ranked_items, key=lambda x: x["value"], reverse=True)
         ranked_asc = sorted(ranked_items, key=lambda x: x["value"], reverse=False)
 
         max_item = ranked_desc[0]
         min_item = ranked_asc[0]
+        top_second = ranked_desc[1] if len(ranked_desc) > 1 else None
 
         title = component_meta.get("title", "")
         chart_config = component_meta.get("chart_config", {}) or {}
-        metric_field_name = chart_config.get("target_metric", "unknown")
-        dimension_field_name = chart_config.get("target_dimension", "unknown")
+        metric_field_name = self._pick_metric_field(chart_config) or "unknown"
+        dimension_field_name = self._pick_dimension_field(chart_config) or "unknown"
+
+        gap_hint = None
+        if top_second is not None:
+            try:
+                gap = max_item["value"] - top_second["value"]
+                if abs(gap) > 0:
+                    gap_hint = (
+                        f"头部第一项与第二项差值约为 {gap:.2f}。"
+                    )
+            except Exception:
+                pass
 
         summary = {
             "component_id": component_id,
@@ -284,8 +338,10 @@ class ResultSummarizer:
             },
             "narrative_hints": [
                 "这是一个排名型柱状图。",
+                "该图适合用于识别头部类别、尾部类别和排序结构。",
                 f"最大类别是 {max_item['category']}，数值为 {max_item['value']:.0f}。",
                 f"最小类别是 {min_item['category']}，数值为 {min_item['value']:.0f}。",
+                *( [gap_hint] if gap_hint else [] ),
                 "洞察生成时应优先使用 ranking_insights.top_items_desc[0] 作为最高项依据。"
             ]
         }
@@ -333,8 +389,16 @@ class ResultSummarizer:
 
         title = component_meta.get("title", "")
         chart_config = component_meta.get("chart_config", {}) or {}
-        metric_field_name = chart_config.get("target_metric", "unknown")
-        dimension_field_name = chart_config.get("target_dimension", "unknown")
+        metric_field_name = self._pick_metric_field(chart_config) or "unknown"
+        dimension_field_name = self._pick_dimension_field(chart_config) or "unknown"
+
+        delta_hint = None
+        try:
+            delta = end_point["value"] - start_point["value"]
+            if abs(delta) > 0:
+                delta_hint = f"起止点变化约为 {delta:.2f}。"
+        except Exception:
+            pass
 
         summary = {
             "component_id": component_id,
@@ -368,9 +432,11 @@ class ResultSummarizer:
             },
             "narrative_hints": [
                 "这是一个趋势型折线图。",
+                "该图适合用于识别峰值时点、谷值时点和整体趋势方向。",
                 f"峰值出现在 {peak_point['time']}，数值为 {peak_point['value']:.2f}。",
                 f"谷值出现在 {valley_point['time']}，数值为 {valley_point['value']:.2f}。",
-                f"整体趋势判断为 {trend_direction}。"
+                f"整体趋势判断为 {trend_direction}。",
+                *( [delta_hint] if delta_hint else [] )
             ]
         }
         return self._to_native(summary)
@@ -407,8 +473,22 @@ class ResultSummarizer:
         top_item_share = top_item["value"] / total
 
         chart_config = component_meta.get("chart_config", {}) or {}
-        metric_field_name = chart_config.get("target_metric", "unknown")
-        dimension_field_name = chart_config.get("target_dimension", "unknown")
+        metric_field_name = self._pick_metric_field(chart_config) or "unknown"
+        dimension_field_name = self._pick_dimension_field(chart_config) or "unknown"
+
+        concentration_level = (
+            "high" if top_item_share >= 0.5 else
+            "medium" if top_item_share >= 0.25 else
+            "low"
+        )
+
+        concentration_hint = None
+        if concentration_level == "high":
+            concentration_hint = "头部类别集中度较高，说明构成明显偏向少数类别。"
+        elif concentration_level == "medium":
+            concentration_hint = "头部类别存在一定集中，但仍保留一定分散性。"
+        else:
+            concentration_hint = "整体构成相对分散，没有单一类别形成绝对主导。"
 
         summary = {
             "component_id": component_id,
@@ -431,16 +511,14 @@ class ResultSummarizer:
             "composition_insights": {
                 "top_items_desc": ranked_desc[:5],
                 "total_value": total,
-                "concentration_level": (
-                    "high" if top_item_share >= 0.5 else
-                    "medium" if top_item_share >= 0.25 else
-                    "low"
-                )
+                "concentration_level": concentration_level
             },
             "narrative_hints": [
                 "这是一个构成型饼图。",
+                "该图适合用于识别头部构成项及整体集中程度。",
                 f"占比最高的类别是 {top_item['category']}，对应数值 {top_item['value']:.2f}。",
-                f"其占整体比例约为 {top_item_share:.1%}。"
+                f"其占整体比例约为 {top_item_share:.1%}。",
+                concentration_hint
             ]
         }
         return self._to_native(summary)
@@ -452,7 +530,14 @@ class ResultSummarizer:
         component_meta: Dict[str, Any]
     ) -> Dict[str, Any]:
         x_arr = np.array(trace.x if trace.x is not None else [], dtype=object)
-        y_arr = self._safe_number_list(trace.y if trace.y is not None else [])
+        y_values = self._safe_number_list(trace.y if trace.y is not None else [])
+
+        x_numeric = self._safe_number_list(x_arr)
+        row_count = min(len(x_arr), len(y_values)) if y_values else len(x_arr)
+
+        chart_config = component_meta.get("chart_config", {}) or {}
+        metric_field_name = self._pick_metric_field(chart_config) or "unknown"
+        dimension_field_name = self._pick_dimension_field(chart_config) or "unknown"
 
         summary = {
             "component_id": component_id,
@@ -461,13 +546,28 @@ class ResultSummarizer:
             "viz_type": "scatter",
             "semantic_role": "distribution_chart",
             "data_profile": {
-                "row_count": min(len(x_arr), len(y_arr))
+                "row_count": row_count,
+                "dimension_field": dimension_field_name,
+                "metric_field": metric_field_name,
+                "dimension_label": self._detect_dimension_label(dimension_field_name),
+                "metric_label": self._detect_metric_label(metric_field_name),
+                "x_range": self._safe_range(x_numeric),
+                "y_range": self._safe_range(y_values)
             },
             "narrative_hints": [
                 "这是一个散点分布图。",
-                "当前版本未对普通 Plotly 散点图做更深层模式提取。"
+                "该图适合用于观察分布范围、离散程度和异常值位置。",
+                f"当前有效点数约为 {row_count}。"
             ]
         }
+
+        if y_values:
+            summary["headline_facts"] = {
+                "max_y": max(y_values),
+                "min_y": min(y_values),
+                "mean_y": self._safe_mean(y_values)
+            }
+
         return self._to_native(summary)
 
     # =========================================================
@@ -481,7 +581,6 @@ class ResultSummarizer:
         global_id_map: Dict[str, str]
     ) -> Dict[str, Any]:
         layer_type = payload.get("layer_type", "map")
-        mapping = payload.get("mapping", {}) or {}
         data_list = payload.get("data", []) or []
 
         if layer_type in ['choropleth', 'animated_choropleth']:
@@ -508,7 +607,10 @@ class ResultSummarizer:
             "data_profile": {
                 "row_count": len(data_list)
             },
-            "narrative_hints": [f"未针对地图类型 {layer_type} 做专门摘要。"]
+            "narrative_hints": [
+                f"未针对地图类型 {layer_type} 做专门摘要。",
+                "建议优先结合地图标题和核心指标字段理解该组件。"
+            ]
         })
 
     def _summarize_protocol_choropleth(
@@ -529,7 +631,10 @@ class ResultSummarizer:
             try:
                 value = float(row.get(value_key, 0))
                 raw_id = str(row.get(id_key, "unknown"))
-                translated = global_id_map.get(raw_id, row.get("zone") or row.get("name") or row.get("borough") or raw_id)
+                translated = global_id_map.get(
+                    raw_id,
+                    row.get("zone") or row.get("name") or row.get("borough") or raw_id
+                )
                 ranked_items.append({
                     "entity_id": raw_id,
                     "entity_name": str(translated),
@@ -583,6 +688,7 @@ class ResultSummarizer:
             },
             "narrative_hints": [
                 "这是一个区域热点分布地图。",
+                "该图适合用于识别热点区域、冷点区域和区域排序结构。",
                 f"最高值区域是 {hottest['entity_name']}，数值为 {hottest['value']:.2f}。",
                 f"最低值区域是 {coldest['entity_name']}，数值为 {coldest['value']:.2f}。",
                 "洞察生成时应优先使用 spatial_insights.top_regions_desc[0] 作为热点区域依据。"
@@ -594,6 +700,7 @@ class ResultSummarizer:
                 "is_time_animated": True,
                 "timestamp_field": mapping.get("timestamp")
             }
+            summary["narrative_hints"].append("该地图包含时间动画语义，可结合时间变化理解热点迁移。")
 
         return self._to_native(summary)
 
@@ -640,6 +747,7 @@ class ResultSummarizer:
             },
             "narrative_hints": [
                 "这是一个点分布地图。",
+                "该图适合用于识别点位密度、分布范围和热点聚集位置。",
                 f"有效点数量为 {len(valid_points)}。"
             ]
         }
@@ -655,7 +763,8 @@ class ResultSummarizer:
                 if vals:
                     summary["headline_facts"] = {
                         "max_value": max(vals),
-                        "min_value": min(vals)
+                        "min_value": min(vals),
+                        "mean_value": self._safe_mean(vals)
                     }
 
             if lat_key and lon_key:
@@ -716,6 +825,7 @@ class ResultSummarizer:
             },
             "narrative_hints": [
                 "这是一个热力密度图。",
+                "该图适合用于识别空间密度高低与热点聚集区域。",
                 f"有效空间点数量为 {valid_points}。"
             ]
         }
@@ -740,6 +850,8 @@ class ResultSummarizer:
     ) -> Dict[str, Any]:
         if isinstance(result_obj, pd.Series):
             row_count = len(result_obj)
+            numeric_values = self._safe_number_list(result_obj.tolist())
+
             summary = {
                 "component_id": component_id,
                 "component_type": component_meta.get("component_type", "table"),
@@ -750,8 +862,19 @@ class ResultSummarizer:
                     "row_count": row_count,
                     "dtype": str(result_obj.dtype)
                 },
-                "narrative_hints": [f"结果为 Series，共 {row_count} 条数据。"]
+                "narrative_hints": [
+                    f"结果为 Series，共 {row_count} 条数据。",
+                    "该结果适合用于数值趋势或单列统计校验。"
+                ]
             }
+
+            if numeric_values:
+                summary["headline_facts"] = {
+                    "max_value": max(numeric_values),
+                    "min_value": min(numeric_values),
+                    "mean_value": self._safe_mean(numeric_values)
+                }
+
             return self._to_native(summary)
 
         if isinstance(result_obj, gpd.GeoDataFrame):
@@ -767,13 +890,19 @@ class ResultSummarizer:
                     "columns": list(result_obj.columns),
                     "crs": str(result_obj.crs) if result_obj.crs is not None else None
                 },
-                "narrative_hints": [f"结果为 GeoDataFrame，共 {row_count} 条空间记录。"]
+                "narrative_hints": [
+                    f"结果为 GeoDataFrame，共 {row_count} 条空间记录。",
+                    "该结果适合用于空间明细校验与区域属性检查。"
+                ]
             }
             return self._to_native(summary)
 
         if isinstance(result_obj, pd.DataFrame):
             row_count = len(result_obj)
             columns = list(result_obj.columns)
+            numeric_cols = list(result_obj.select_dtypes(include=[np.number]).columns)
+            object_cols = list(result_obj.select_dtypes(include=['object', 'category']).columns)
+            time_cols = [c for c in columns if pd.api.types.is_datetime64_any_dtype(result_obj[c])]
 
             summary = {
                 "component_id": component_id,
@@ -783,18 +912,32 @@ class ResultSummarizer:
                 "semantic_role": "table_result",
                 "data_profile": {
                     "row_count": row_count,
-                    "columns": columns[:50]
+                    "columns": columns[:50],
+                    "numeric_columns": numeric_cols[:10],
+                    "categorical_columns": object_cols[:10],
+                    "time_columns": time_cols[:10]
                 },
-                "narrative_hints": [f"结果为 DataFrame，共 {row_count} 条记录。"]
+                "narrative_hints": [
+                    f"结果为 DataFrame，共 {row_count} 条记录。",
+                    "该结果适合用于明细验证、数值对比和结构化分析补充。"
+                ]
             }
 
-            time_cols = [c for c in columns if pd.api.types.is_datetime64_any_dtype(result_obj[c])]
-            numeric_cols = list(result_obj.select_dtypes(include=[np.number]).columns)
+            if numeric_cols:
+                first_num = numeric_cols[0]
+                series = pd.to_numeric(result_obj[first_num], errors='coerce').dropna()
+                if not series.empty:
+                    summary["headline_facts"] = {
+                        "primary_numeric_field": first_num,
+                        "max_value": float(series.max()),
+                        "min_value": float(series.min()),
+                        "mean_value": float(series.mean())
+                    }
 
             if time_cols and numeric_cols:
                 tc = time_cols[0]
                 vc = numeric_cols[0]
-                series = result_obj[vc].dropna()
+                series = pd.to_numeric(result_obj[vc], errors='coerce').dropna()
                 if not series.empty:
                     summary["temporal_insights"] = {
                         "time_field": tc,
@@ -804,6 +947,7 @@ class ResultSummarizer:
                         "start_time": str(result_obj[tc].min()),
                         "end_time": str(result_obj[tc].max())
                     }
+                    summary["narrative_hints"].append("结果同时包含时间列与数值列，可用于时间变化分析。")
 
             return self._to_native(summary)
 

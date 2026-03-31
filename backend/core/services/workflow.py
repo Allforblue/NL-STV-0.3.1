@@ -40,9 +40,10 @@ class AnalysisWorkflow:
     3. Generate / Selection Edit / Component Edit 三路分流
     4. 看板规划、代码生成与执行
     5. 将完整组件 metadata 传入 executor，提升执行摘要质量
-    6. 洞察生成与状态快照固化
-    7. Edit Mode 失败时安全降级为 Generate
-    8. 支持 interaction_state / component_render_meta 的读写
+    6. 将 interaction_state 传入 executor，支持 selection / compare 上下文洞察
+    7. 洞察生成与状态快照固化
+    8. Edit Mode 失败时安全降级为 Generate
+    9. 支持 interaction_state / component_render_meta 的读写
     """
 
     def __init__(self, llm_client: AIClient):
@@ -72,10 +73,10 @@ class AnalysisWorkflow:
         edit_keywords = [
             "修改", "改成", "改为", "改一下", "调整", "优化", "放大", "缩小",
             "换成", "切换", "增加", "新增", "删除", "移除", "保留", "联动",
-            "筛选", "高亮", "隐藏", "显示", "标题改", "颜色改", "把这个图",
+            "标题改", "把这个图",
             "把这张图", "当前图", "现有图", "看板里", "右侧图", "地图上",
             "change", "edit", "modify", "update", "switch", "replace", "adjust",
-            "filter", "highlight", "rename", "retitle"
+            "rename", "retitle"
         ]
 
         generate_keywords = [
@@ -106,8 +107,8 @@ class AnalysisWorkflow:
         structural_keywords = [
             "新增一个图", "增加一个图", "再加一个图", "加一个图表",
             "删除这个图", "删掉这个图", "移除这个图",
-            "调整布局", "重新布局", "交换位置", "左右交换", "放到下面", "放到右边",
-            "增加对比", "整体对比", "区域对比", "多个区域", "多选区", "对比分析",
+            "调整布局", "重新布局", "交换位置", "放到下面",
+            "增加对比", "整体对比", "区域对比",
             "add a chart", "add another chart", "remove this chart",
             "change layout", "rearrange", "compare selected area", "compare regions"
         ]
@@ -120,7 +121,6 @@ class AnalysisWorkflow:
         return "def get_dashboard_data" in code
 
     async def _decide_workflow_mode(self, payload: InteractionPayload, last_state: dict) -> bool:
-        # UI 操作一定优先视为编辑类流转
         if payload.trigger_type == InteractionTriggerType.UI_ACTION:
             logger.info(">>> [Mode Decision] 判定为 Edit: 触发源为 UI 交互")
             return True
@@ -639,7 +639,6 @@ class AnalysisWorkflow:
                     None
                 )
 
-                # === 2.1 使用 interaction_router 判定具体编辑路径 ===
                 try:
                     route_info = self.interaction_router.classify(
                         payload=payload,
@@ -803,7 +802,8 @@ class AnalysisWorkflow:
                 data_context=actual_data_context,
                 component_ids=comp_ids,
                 summaries=data_summaries,
-                component_defs=dashboard_plan.components
+                component_defs=dashboard_plan.components,
+                interaction_state=updated_interaction_state
             )
 
             # === 3.1 自愈 / 降级机制 ===
@@ -822,12 +822,15 @@ class AnalysisWorkflow:
 
                     comp_ids = [c.id for c in dashboard_plan.components]
 
+                    current_interaction_state = session_service.get_interaction_state(payload.session_id) or updated_interaction_state
+
                     exec_result = self.executor.execute_dashboard_logic(
                         code_str=current_code,
                         data_context=actual_data_context,
                         component_ids=comp_ids,
                         summaries=data_summaries,
-                        component_defs=dashboard_plan.components
+                        component_defs=dashboard_plan.components,
+                        interaction_state=current_interaction_state
                     )
 
                     if not exec_result.success:
@@ -847,12 +850,15 @@ class AnalysisWorkflow:
                     if not self._has_dashboard_wrapper(current_code):
                         raise Exception("代码修复失败：fix_code 未返回完整 get_dashboard_data 包装函数。")
 
+                    current_interaction_state = session_service.get_interaction_state(payload.session_id) or updated_interaction_state
+
                     exec_result = self.executor.execute_dashboard_logic(
                         code_str=current_code,
                         data_context=actual_data_context,
                         component_ids=comp_ids,
                         summaries=data_summaries,
-                        component_defs=dashboard_plan.components
+                        component_defs=dashboard_plan.components,
+                        interaction_state=current_interaction_state
                     )
 
                     if not exec_result.success:

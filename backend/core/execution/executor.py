@@ -52,6 +52,7 @@ class CodeExecutor:
     2. 构建全局 ID 语义字典
     3. 接收完整 component metadata，并传给 ResultSummarizer
     4. 返回结构化执行结果
+    5. 为 InsightExtractor 注入 interaction / compare 上下文摘要
 
     不再承担：
     - 图表/地图的手工摘要逻辑
@@ -167,10 +168,8 @@ class CodeExecutor:
         map_config = comp.get('map_config', []) if is_dict else getattr(comp, 'map_config', [])
         layout = comp.get('layout', {}) if is_dict else getattr(comp, 'layout', {})
 
-        # 兼容 Enum / Pydantic / 普通对象
         component_type_str = str(component_type).split('.')[-1].lower()
 
-        # 若 config 是 Pydantic 对象，尽量转 dict
         if hasattr(chart_config, "model_dump"):
             chart_config = chart_config.model_dump()
         elif chart_config is None:
@@ -179,7 +178,6 @@ class CodeExecutor:
         if hasattr(layout, "model_dump"):
             layout = layout.model_dump()
 
-        # map_config 可能是对象列表
         if isinstance(map_config, list):
             normalized_map_config = []
             for item in map_config:
@@ -220,7 +218,6 @@ class CodeExecutor:
                 except Exception as e:
                     logger.warning(f"[Executor] Failed to parse component meta: {e}")
 
-        # 回退补齐：防止某些 component_ids 没在 component_defs 里
         for cid in component_ids:
             if cid not in meta_map:
                 inferred_type = "map" if "map" in cid else ("insight" if "insight" in cid else "chart")
@@ -235,13 +232,108 @@ class CodeExecutor:
 
         return meta_map
 
+    def _build_interaction_context(
+        self,
+        interaction_state: Optional[Dict[str, Any]]
+    ) -> Dict[str, Any]:
+        """
+        构建顶层 interaction/compare 上下文，供 InsightExtractor 使用。
+        当前策略：
+        - 不改变组件级摘要结构
+        - 在 global_insight_data 顶层增加 _context
+        """
+        if not interaction_state or not isinstance(interaction_state, dict):
+            return {
+                "selection_enabled": False,
+                "active_selection_count": 0,
+                "active_selection_labels": [],
+                "compare_enabled": False,
+                "baseline_mode": "global",
+                "left_selection_labels": [],
+                "right_selection_labels": [],
+                "active_component_id": None
+            }
+
+        selections = interaction_state.get("selections", []) or []
+        active_selection_ids = interaction_state.get("active_selection_ids", []) or []
+        active_id_set = set(active_selection_ids)
+
+        comparison_state = interaction_state.get("comparison_state", {}) or {}
+        left_ids = comparison_state.get("left_selection_ids", []) or []
+        right_ids = comparison_state.get("right_selection_ids", []) or []
+
+        selection_map = {}
+        for item in selections:
+            if not isinstance(item, dict):
+                continue
+            sid = item.get("selection_id")
+            if sid:
+                selection_map[sid] = item
+
+        def _label_for_selection_id(sid: str) -> str:
+            item = selection_map.get(sid, {}) or {}
+            return (
+                item.get("label")
+                or item.get("selection_context", {}).get("display_value")
+                or item.get("selection_id")
+                or str(sid)
+            )
+
+        active_labels = [
+            _label_for_selection_id(sid)
+            for sid in active_selection_ids
+            if sid in selection_map
+        ]
+
+        left_labels = [
+            _label_for_selection_id(sid)
+            for sid in left_ids
+            if sid in selection_map
+        ]
+
+        right_labels = [
+            _label_for_selection_id(sid)
+            for sid in right_ids
+            if sid in selection_map
+        ]
+
+        active_items = [
+            selection_map[sid]
+            for sid in active_selection_ids
+            if sid in selection_map
+        ]
+
+        active_selection_types = []
+        for item in active_items:
+            sel_type = item.get("selection_type")
+            if sel_type and sel_type not in active_selection_types:
+                active_selection_types.append(sel_type)
+
+        return {
+            "selection_enabled": len(active_id_set) > 0,
+            "active_selection_count": len(active_selection_ids),
+            "active_selection_labels": active_labels,
+            "active_selection_types": active_selection_types,
+            "compare_enabled": bool(comparison_state.get("enabled")),
+            "baseline_mode": comparison_state.get("baseline_mode", "global"),
+            "left_selection_labels": left_labels,
+            "right_selection_labels": right_labels,
+            "left_selection_count": len(left_ids),
+            "right_selection_count": len(right_ids),
+            "active_component_id": interaction_state.get("active_component_id"),
+            "compare_question": comparison_state.get("compare_question"),
+            "compare_metric": comparison_state.get("compare_metric"),
+            "compare_dimension": comparison_state.get("compare_dimension")
+        }
+
     def execute_dashboard_logic(
         self,
         code_str: str,
         data_context: Dict[str, Any],
         component_ids: List[str],
         summaries: List[Dict[str, Any]] = None,
-        component_defs: Optional[List[Any]] = None
+        component_defs: Optional[List[Any]] = None,
+        interaction_state: Optional[Dict[str, Any]] = None
     ) -> DashboardExecutionResult:
 
         clean_code = self._dedent_code(code_str)
@@ -287,13 +379,16 @@ class CodeExecutor:
             final_results: Dict[str, ComponentResult] = {}
             insight_payload: Dict[str, Any] = {}
 
-            # 5. 使用完整 component metadata 构建 meta_map
+            # 5. 顶层 interaction / compare context
+            insight_payload["_context"] = self._build_interaction_context(interaction_state)
+
+            # 6. 使用完整 component metadata 构建 meta_map
             component_meta_map = self._build_component_meta_map(
                 component_ids=component_ids,
                 component_defs=component_defs
             )
 
-            # 6. 对每个组件结果做统一摘要
+            # 7. 对每个组件结果做统一摘要
             for cid in component_ids:
                 if cid not in all_results:
                     continue
